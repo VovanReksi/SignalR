@@ -54,11 +54,11 @@ namespace ChatSample
             services.AddTransient<IEmailSender, AuthMessageSender>();
             services.AddTransient<ISmsSender, AuthMessageSender>();
 
-            services.AddSignalR();
-
+            services.AddSignalR().AddRedis();
             services.AddAuthentication();
 
-            services.AddSingleton<IPresenceManager, DefaultPresenceManager<Chat>>();
+            // services.AddSingleton<IPresenceManager, DefaultPresenceManager<Chat>>();
+            services.AddSingleton<IPresenceManager, RedisPresenceManager<Chat>>();
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.

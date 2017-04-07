@@ -1,27 +1,34 @@
-﻿
-using Microsoft.AspNetCore.SignalR;
-using Microsoft.Extensions.DependencyInjection;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
-using System;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.AspNetCore.SignalR.Redis;
 using Microsoft.AspNetCore.Sockets;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using StackExchange.Redis;
 
 namespace ChatSample
 {
-    // TODO: not possible to use TClient instead of (implicit) IClientProxy
-    // public class DefaultPresenceManager<THub> : IPresenceManager where THub : HubWithPresence<TClient>
-    public class DefaultPresenceManager<THub> : IPresenceManager where THub : HubWithPresence
+    public class RedisPresenceManager<THub> : IDisposable, IPresenceManager where THub : HubWithPresence
     {
         private IHubContext<THub> _hubContext;
         private HubLifetimeManager<THub> _lifetimeManager;
         private readonly IServiceScopeFactory _serviceScopeFactory;
+        private readonly ConnectionMultiplexer _redisConnection;
 
-        public DefaultPresenceManager(IHubContext<THub> hubContext, HubLifetimeManager<THub> lifetimeManager, IServiceScopeFactory serviceScopeFactory)
+        public RedisPresenceManager(IHubContext<THub> hubContext, HubLifetimeManager<THub> lifetimeManager,
+            IServiceScopeFactory serviceScopeFactory, IOptions<RedisOptions> options)
         {
             _hubContext = hubContext;
             _lifetimeManager = lifetimeManager;
             _serviceScopeFactory = serviceScopeFactory;
+            options.Value.Factory
         }
 
         private readonly ConcurrentDictionary<Connection, UserDetails> usersOnline
