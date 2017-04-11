@@ -29,6 +29,8 @@ namespace Microsoft.AspNetCore.SignalR.Redis
 
         private readonly IHubProtocol _protocol = new JsonHubProtocol();
 
+        private long _nextInvocationId = 0;
+
         public RedisHubLifetimeManager(ILoggerFactory loggerFactory,
                                        IOptions<RedisOptions> options)
         {
@@ -86,7 +88,6 @@ namespace Microsoft.AspNetCore.SignalR.Redis
 
         private async Task PublishAsync(string channel, HubMessage hubMessage)
         {
-            // BAD
             var payload = await _protocol.WriteToArrayAsync(hubMessage);
 
             await _bus.PublishAsync(channel, payload);
@@ -264,9 +265,10 @@ namespace Microsoft.AspNetCore.SignalR.Redis
             }
         }
 
-        private static string GetInvocationId()
+        private string GetInvocationId()
         {
-            return Guid.NewGuid().ToString("N");
+            var invocationId = Interlocked.Increment(ref _nextInvocationId) - 1;
+            return invocationId.ToString();
         }
 
         private class LoggerTextWriter : TextWriter

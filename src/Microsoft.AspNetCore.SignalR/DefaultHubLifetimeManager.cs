@@ -3,16 +3,16 @@
 
 using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR.Internal.Protocol;
 using Microsoft.AspNetCore.Sockets;
-using Microsoft.Extensions.Internal;
 
 namespace Microsoft.AspNetCore.SignalR
 {
     public class DefaultHubLifetimeManager<THub> : HubLifetimeManager<THub>
     {
+        private long _nextInvocationId = 0;
         private readonly ConnectionList _connections = new ConnectionList();
         private readonly IHubProtocol _protocol = new JsonHubProtocol();
 
@@ -121,9 +121,10 @@ namespace Microsoft.AspNetCore.SignalR
             }
         }
 
-        private static string GetInvocationId()
+        private string GetInvocationId()
         {
-            return Guid.NewGuid().ToString("N");
+            var invocationId = Interlocked.Increment(ref _nextInvocationId) - 1;
+            return invocationId.ToString();
         }
     }
 }

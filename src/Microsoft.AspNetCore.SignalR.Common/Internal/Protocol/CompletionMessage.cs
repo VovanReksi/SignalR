@@ -19,12 +19,14 @@ namespace Microsoft.AspNetCore.SignalR.Internal.Protocol
             }
             Error = error;
             Result = result;
+            HasResult = hasResult;
         }
 
         public override string ToString()
         {
             var errorStr = Error == null ? "<<null>>" : $"\"{Error}\"";
-            return $"Completion {{ {nameof(InvocationId)}: \"{InvocationId}\", {nameof(Error)}: {errorStr}, {nameof(Result)}: {Result ?? "<<null>>"} }}";
+            var resultField = HasResult ? $", {nameof(Result)}: {Result ?? "<<null>>"}" : string.Empty;
+            return $"Completion {{ {nameof(InvocationId)}: \"{InvocationId}\", {nameof(Error)}: {errorStr}{resultField} }}";
         }
 
         // Static factory methods. Don't want to use constructor overloading because it will break down

@@ -4,8 +4,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Threading;
@@ -28,10 +26,8 @@ namespace Microsoft.AspNetCore.SignalR.Client
 
         private readonly CancellationTokenSource _connectionActive = new CancellationTokenSource();
 
-        // We need to ensure pending calls added after a connection failure don't hang. Right now the easiest thing to do is lock.
         private readonly object _pendingCallsLock = new object();
         private readonly Dictionary<string, InvocationRequest> _pendingCalls = new Dictionary<string, InvocationRequest>();
-
         private readonly ConcurrentDictionary<string, InvocationHandler> _handlers = new ConcurrentDictionary<string, InvocationHandler>();
 
         private int _nextId = 0;
@@ -105,6 +101,11 @@ namespace Microsoft.AspNetCore.SignalR.Client
         public Task<object> Invoke(string methodName, Type returnType, params object[] args) => Invoke(methodName, returnType, CancellationToken.None, args);
         public async Task<object> Invoke(string methodName, Type returnType, CancellationToken cancellationToken, params object[] args)
         {
+            if (_connectionActive.Token.IsCancellationRequested)
+            {
+                throw new InvalidOperationException("Connection has been terminated.");
+            }
+
             _logger.LogTrace("Preparing invocation of '{0}', with return type '{1}' and {2} args", methodName, returnType.AssemblyQualifiedName, args.Length);
 
             // Create an invocation descriptor.
@@ -114,43 +115,33 @@ namespace Microsoft.AspNetCore.SignalR.Client
             _logger.LogDebug("Registering Invocation ID '{0}' for tracking", invocationMessage.InvocationId);
             var irq = new InvocationRequest(cancellationToken, returnType);
 
-            lock (_pendingCallsLock)
-            {
-                if (_connectionActive.IsCancellationRequested)
-                {
-                    throw new InvalidOperationException("Connection has been terminated.");
-                }
-                _pendingCalls.Add(invocationMessage.InvocationId, irq);
-            }
+            EnqueueRequest(invocationMessage.InvocationId, irq);
 
-            // Trace the invocation, but only if that logging level is enabled (because building the args list is a bit slow)
+            // Trace the full invocation, but only if that logging level is enabled (because building the args list is a bit slow)
             if (_logger.IsEnabled(LogLevel.Trace))
             {
                 var argsList = string.Join(", ", args.Select(a => a.GetType().FullName));
-                _logger.LogTrace("Invocation #{0}: {1} {2}({3})", invocationMessage.InvocationId, returnType.FullName, methodName, argsList);
+                _logger.LogTrace("Issuing Invocation '{invocationId}': {returnType} {methodName}({args})", invocationMessage.InvocationId, returnType.FullName, methodName, argsList);
             }
 
             try
             {
                 var payload = await _protocol.WriteToArrayAsync(invocationMessage);
 
-                _logger.LogInformation("Sending Invocation #{0}", invocationMessage.InvocationId);
+                _logger.LogInformation("Sending Invocation '{invocationId}'", invocationMessage.InvocationId);
 
                 await _connection.SendAsync(payload, _protocol.MessageType, cancellationToken);
-                _logger.LogInformation("Sending Invocation #{0} complete", invocationMessage.InvocationId);
+                _logger.LogInformation("Sending Invocation '{invocationId}' complete", invocationMessage.InvocationId);
             }
             catch (Exception ex)
             {
-                _logger.LogError(0, ex, "Sending Invocation #{0} failed", invocationMessage.InvocationId);
-                irq.Completion.TrySetException(ex);
-                lock (_pendingCallsLock)
-                {
-                    _pendingCalls.Remove(invocationMessage.InvocationId);
-                }
+                _logger.LogError(0, ex, "Sending Invocation '{invocationId}' failed", invocationMessage.InvocationId);
+                irq.Complete(ex);
+                RemoveRequest(invocationMessage.InvocationId);
             }
 
             // Return the completion task. It will be completed by ReceiveMessages when the response is received.
-            return await irq.Completion.Task;
+            return await irq.Completion;
         }
 
         private void OnDataReceived(byte[] data, MessageType messageType)
@@ -158,23 +149,42 @@ namespace Microsoft.AspNetCore.SignalR.Client
             if (!_protocol.TryParseMessage(data, _binder, out var message))
             {
                 _logger.LogError("Received invalid message");
-                throw new InvalidOperationException("Received invalid message");
+                return;
             }
 
+            InvocationRequest irq;
             switch (message)
             {
                 case InvocationMessage invocation:
+                    if (_logger.IsEnabled(LogLevel.Trace))
+                    {
+                        var argsList = string.Join(", ", invocation.Arguments.Select(a => a.GetType().FullName));
+                        _logger.LogTrace("Received Invocation '{invocationId}': {methodName}({args})", invocation.InvocationId, invocation.Target, argsList);
+                    }
                     DispatchInvocation(invocation, _connectionActive.Token);
                     break;
                 case ResultMessage result:
-                    InvocationRequest irq;
                     lock (_pendingCallsLock)
                     {
-                        _connectionActive.Token.ThrowIfCancellationRequested();
-                        irq = _pendingCalls[result.InvocationId];
-                        _pendingCalls.Remove(result.InvocationId);
+                        if (!_pendingCalls.TryGetValue(result.InvocationId, out irq))
+                        {
+                            _logger.LogWarning("Dropped unsolicited Result message for invocation '{invocationId}'", result.InvocationId);
+                            return;
+                        }
                     }
                     DispatchInvocationResult(result, irq, _connectionActive.Token);
+                    break;
+                case CompletionMessage completion:
+                    lock (_pendingCallsLock)
+                    {
+                        if (!_pendingCalls.TryGetValue(completion.InvocationId, out irq))
+                        {
+                            _logger.LogWarning("Dropped unsolicited Completion message for invocation '{invocationId}'", completion.InvocationId);
+                            return;
+                        }
+                    }
+                    DispatchInvocationCompletion(completion, irq, _connectionActive.Token);
+                    RemoveRequest(completion.InvocationId);
                     break;
             }
         }
@@ -187,19 +197,19 @@ namespace Microsoft.AspNetCore.SignalR.Client
                 _logger.LogError("Connection is shutting down due to an error: {0}", ex);
             }
 
+            _connectionActive.Cancel();
+
             lock (_pendingCallsLock)
             {
-                _connectionActive.Cancel();
                 foreach (var call in _pendingCalls.Values)
                 {
                     if (ex != null)
                     {
-                        call.Completion.TrySetException(ex);
+                        call.Complete(ex);
                     }
-                    else
-                    {
-                        call.Completion.TrySetCanceled();
-                    }
+
+                    // This will cancel the completion if nobody has done so already.
+                    call.Dispose();
                 }
                 _pendingCalls.Clear();
             }
@@ -228,25 +238,70 @@ namespace Microsoft.AspNetCore.SignalR.Client
                 return;
             }
 
-            Debug.Assert(irq.Completion != null, "Didn't properly capture InvocationRequest in callback for ReadInvocationResultDescriptorAsync");
-
             // If the invocation hasn't been cancelled, dispatch the result
             if (!irq.CancellationToken.IsCancellationRequested)
             {
-                irq.Registration.Dispose();
+                irq.ReceiveResult(result.Result);
+            }
+        }
 
-                // Complete the request based on the result
-                // TODO: the TrySetXYZ methods will cause continuations attached to the Task to run, so we should dispatch to a sync context or thread pool.
-                if (!string.IsNullOrEmpty(result.Error))
+        private void DispatchInvocationCompletion(CompletionMessage completion, InvocationRequest irq, CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("Received Completion for Invocation #{0}", completion.InvocationId);
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            // If the invocation hasn't been cancelled, dispatch the completion
+            if (!irq.CancellationToken.IsCancellationRequested)
+            {
+                if (!string.IsNullOrEmpty(completion.Error))
                 {
-                    _logger.LogInformation("Completing Invocation #{0} with error: {1}", result.InvocationId, result.Error);
-                    irq.Completion.TrySetException(new Exception(result.Error));
+                    irq.Complete(new Exception(completion.Error));
                 }
                 else
                 {
-                    _logger.LogInformation("Completing Invocation #{0} with result of type: {1}", result.InvocationId, result.Result?.GetType()?.FullName ?? "<<void>>");
-                    irq.Completion.TrySetResult(result.Result);
+                    if (completion.HasResult)
+                    {
+                        irq.ReceiveResult(completion.Result);
+                    }
+
+                    irq.Complete();
                 }
+            }
+        }
+
+        private void RemoveRequest(string invocationId)
+        {
+            lock (_pendingCallsLock)
+            {
+                if (!_pendingCalls.ContainsKey(invocationId))
+                {
+                    _logger.LogWarning("Duplicate request to remove invocation {invocationId} from the queue ignored", invocationId);
+                }
+                else
+                {
+                    _pendingCalls.Remove(invocationId);
+                }
+            }
+        }
+
+        private void EnqueueRequest(string invocationId, InvocationRequest irq)
+        {
+            if (_connectionActive.IsCancellationRequested)
+            {
+                throw new InvalidOperationException("Connection has been terminated.");
+            }
+
+            lock (_pendingCallsLock)
+            {
+                if (_pendingCalls.ContainsKey(invocationId))
+                {
+                    throw new InvalidOperationException("An invocation with this ID has already been queued");
+                }
+                _pendingCalls.Add(invocationId, irq);
             }
         }
 
@@ -294,20 +349,65 @@ namespace Microsoft.AspNetCore.SignalR.Client
             }
         }
 
-        private struct InvocationRequest
+        private class InvocationRequest : IDisposable
         {
+            private readonly TaskCompletionSource<object> _completionSource = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+            private readonly CancellationTokenRegistration _cancellationTokenRegistration;
+            private object _lock = new object();
+            private IList<object> _results = new List<object>();
+
             public Type ResultType { get; }
             public CancellationToken CancellationToken { get; }
-            public CancellationTokenRegistration Registration { get; }
-            public TaskCompletionSource<object> Completion { get; }
+
+            public Task<object> Completion => _completionSource.Task;
 
             public InvocationRequest(CancellationToken cancellationToken, Type resultType)
             {
-                var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
-                Completion = tcs;
                 CancellationToken = cancellationToken;
-                Registration = cancellationToken.Register(() => tcs.TrySetCanceled());
+                _cancellationTokenRegistration = cancellationToken.Register(() => _completionSource.TrySetCanceled());
                 ResultType = resultType;
+            }
+
+            public void ReceiveResult(object result)
+            {
+                lock (_lock)
+                {
+                    if (Completion.IsCompleted)
+                    {
+                        throw new InvalidOperationException("Received a result after completion of the invocation");
+                    }
+                    else
+                    {
+                        _results.Add(result);
+                    }
+                }
+            }
+
+            public void Complete(Exception ex = null)
+            {
+                lock (_lock)
+                {
+                    if (ex != null)
+                    {
+                        _completionSource.TrySetException(ex);
+                    }
+                    else if (_results.Count > 1)
+                    {
+                        _completionSource.TrySetException(new NotSupportedException("Multiple return values not yet supported"));
+                    }
+                    else
+                    {
+                        _completionSource.TrySetResult(_results.FirstOrDefault());
+                    }
+                }
+            }
+
+            public void Dispose()
+            {
+                // Just in case it hasn't already been completed
+                _completionSource.TrySetCanceled();
+
+                _cancellationTokenRegistration.Dispose();
             }
         }
     }

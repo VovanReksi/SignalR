@@ -42,11 +42,11 @@ namespace Microsoft.AspNetCore.SignalR.Tests
             _cts = new CancellationTokenSource();
         }
 
-        public async Task<IEnumerable<ResultMessage>> InvokeAndWait(string methodName, params object[] args)
+        public async Task<IEnumerable<object>> InvokeAsync(string methodName, params object[] args)
         {
-            var invocationId = await Invoke(methodName, args);
+            var invocationId = await SendInvocationAsync(methodName, args);
 
-            var results = new List<ResultMessage>();
+            var results = new List<object>();
             while (true)
             {
                 var message = await Read();
@@ -64,9 +64,17 @@ namespace Microsoft.AspNetCore.SignalR.Tests
                 switch (message)
                 {
                     case ResultMessage result:
-                        results.Add(result);
+                        results.Add(result.Result);
                         break;
                     case CompletionMessage completion:
+                        if (!string.IsNullOrEmpty(completion.Error))
+                        {
+                            throw new Exception(completion.Error);
+                        }
+                        else if (completion.HasResult)
+                        {
+                            results.Add(completion.Result);
+                        }
                         return results;
                     default:
                         throw new NotSupportedException("TestClient does not support receiving invocations!");
@@ -74,7 +82,7 @@ namespace Microsoft.AspNetCore.SignalR.Tests
             }
         }
 
-        public async Task<string> Invoke(string methodName, params object[] args)
+        public async Task<string> SendInvocationAsync(string methodName, params object[] args)
         {
             var invocationId = GetInvocationId();
             var payload = await _protocol.WriteToArrayAsync(new InvocationMessage(invocationId, methodName, args));
@@ -86,13 +94,13 @@ namespace Microsoft.AspNetCore.SignalR.Tests
 
         public async Task<HubMessage> Read()
         {
-            while(true)
+            while (true)
             {
                 var message = TryRead();
 
-                if(message == null)
+                if (message == null)
                 {
-                    if(!await Application.Input.WaitToReadAsync())
+                    if (!await Application.Input.WaitToReadAsync())
                     {
                         return null;
                     }
